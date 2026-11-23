@@ -619,8 +619,13 @@ void GenericDriver::loop(IHidTransport* host, UPSData& data, uint32_t now) {
     if (!_step_now && (now - _last_step) < stepSpacingMs()) return;
 
     // Skipped reports cost no request, so they take no step either
+    // [EXPERIMENT] Feature report 30 (Outlet.PercentLoad) of the Vertiv Edge panics the HCD
+    auto exp_skip = [](const PollItem& it) {
+        return it.report_type == 3 && it.id == 30;
+    };
     while (_queue_pos < _queue.size() &&
-           (isFreshFromInput(host, _queue[_queue_pos], now) || isStaticAndKnown(_queue[_queue_pos]))) {
+           (isFreshFromInput(host, _queue[_queue_pos], now) || isStaticAndKnown(_queue[_queue_pos]) ||
+            exp_skip(_queue[_queue_pos]))) {
         _queue_pos++;
     }
     if (_queue_pos >= _queue.size()) return;
