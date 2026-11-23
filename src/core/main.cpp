@@ -27,24 +27,39 @@
 
 // [EXPERIMENT] Logs the USB events of the previous boot after a crash reset, oldest first,
 // with the time relative to the last event (the panic follows it closely)
-static void logPreviousUsbTrace() {
-    esp_reset_reason_t r = esp_reset_reason();
-    static usb_trace_ev_t evs[USB_TRACE_LEN];
-    uint16_t n = usb_trace_take_previous(evs, USB_TRACE_LEN);
-    if (n == 0) return;
-    if (r != ESP_RST_PANIC && r != ESP_RST_INT_WDT && r != ESP_RST_TASK_WDT && r != ESP_RST_WDT) return;
-    // Only the tail matters: the last 40 events before the crash
-    uint16_t first = n > 40 ? n - 40 : 0;
-    uint32_t t_last = evs[n - 1].t_ms;
-    AppLogger::log("ERROR", "[TRACE] USB events before the crash: %u recorded, last %u shown (t = ms before last event, uptime of last %lu ms)",
-                   (unsigned)n, (unsigned)(n - first), (unsigned long)t_last);
+// [EXPERIMENT] Logs USB trace events, oldest first, with the uptime of each (ms since boot)
+static void logUsbTrace(const char* tag, const char* what, usb_trace_ev_t* evs, uint16_t n, uint16_t show) {
+    uint16_t first = n > show ? n - show : 0;
+    AppLogger::log("WARN", "[%s] %s: %u recorded, last %u shown (t = ms since boot)",
+                   tag, what, (unsigned)n, (unsigned)(n - first));
     for (uint16_t i = first; i < n; i++) {
         delay(15); // the log queue holds 40 lines: let the syslog task drain it
+        if ((i & 15) == 0) esp_task_wdt_reset();
         const usb_trace_ev_t& e = evs[i];
-        AppLogger::log("ERROR", "[TRACE] %3u -%5lu c%u %-15s x=0x%04x d=%02x %02x %02x %02x %02x %02x %02x %02x",
-                       (unsigned)i, (unsigned long)(t_last - e.t_ms), (unsigned)e.core, usb_trace_ev_name(e.ev),
+        AppLogger::log("WARN", "[%s] %3u %6lu c%u %-15s x=0x%04x d=%02x %02x %02x %02x %02x %02x %02x %02x",
+                       tag, (unsigned)i, (unsigned long)e.t_ms, (unsigned)e.core, usb_trace_ev_name(e.ev),
                        (unsigned)e.x, e.d[0], e.d[1], e.d[2], e.d[3], e.d[4], e.d[5], e.d[6], e.d[7]);
     }
+}
+
+static usb_trace_ev_t s_trace_evs[USB_TRACE_LEN];
+
+// [EXPERIMENT] The previous boot's events after a crash or a controlled (software) restart
+static void logPreviousUsbTrace() {
+    esp_reset_reason_t r = esp_reset_reason();
+    uint16_t n = usb_trace_take_previous(s_trace_evs, USB_TRACE_LEN);
+    if (n == 0) return;
+    if (r != ESP_RST_PANIC && r != ESP_RST_INT_WDT && r != ESP_RST_TASK_WDT && r != ESP_RST_WDT &&
+        r != ESP_RST_SW) return;
+    logUsbTrace("TRACE", r == ESP_RST_SW ? "USB events before the restart" : "USB events before the crash",
+                s_trace_evs, n, 120);
+}
+
+// [EXPERIMENT] This boot's events so far: the clean enumeration to compare a hot plug with
+static void logCurrentUsbTrace() {
+    uint16_t n = usb_trace_snapshot(s_trace_evs, USB_TRACE_LEN);
+    if (n == 0) return;
+    logUsbTrace("TRACE-BOOT", "USB events of this boot", s_trace_evs, n, 80);
 }
 
 USBHostUPS usb_ups;
@@ -379,6 +394,13 @@ void loop() {
     if (!usb_trace_dumped && (WiFi.isConnected() || now > 4000)) {
         usb_trace_dumped = true;
         logPreviousUsbTrace();
+        esp_task_wdt_reset();
+        now = millis();
+    }
+    static bool usb_trace_boot_dumped = false;
+    if (!usb_trace_boot_dumped && now > 15000) {
+        usb_trace_boot_dumped = true;
+        logCurrentUsbTrace();
         esp_task_wdt_reset();
         now = millis();
     }

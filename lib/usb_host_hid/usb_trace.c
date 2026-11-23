@@ -77,6 +77,19 @@ uint16_t usb_trace_take_previous(usb_trace_ev_t *out, uint16_t max)
     return n;
 }
 
+uint16_t usb_trace_snapshot(usb_trace_ev_t *out, uint16_t max)
+{
+    portENTER_CRITICAL_SAFE(&s_lock);
+    uint32_t n = s_head < USB_TRACE_LEN ? s_head : USB_TRACE_LEN;
+    if (n > max) n = max;
+    uint32_t start = s_head - n;
+    for (uint32_t i = 0; i < n; i++) {
+        out[i] = s_ring[(start + i) % USB_TRACE_LEN];
+    }
+    portEXIT_CRITICAL_SAFE(&s_lock);
+    return (uint16_t)n;
+}
+
 const char *usb_trace_ev_name(uint8_t ev)
 {
     switch (ev) {
@@ -97,6 +110,7 @@ const char *usb_trace_ev_name(uint8_t ev)
     case UT_OPEN:            return "OPEN";
     case UT_DEV_GONE:        return "DEV_GONE";
     case UT_APP:             return "APP";
+    case UT_DEV_NEW:         return "DEV_NEW";
     default:                 return "?";
     }
 }

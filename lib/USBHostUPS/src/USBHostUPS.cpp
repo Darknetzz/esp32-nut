@@ -8,6 +8,7 @@
 #include "QxDriver.h"
 #include "QxUsbTransports.h"
 #include <stdarg.h>
+#include "usb/usb_trace.h" // [EXPERIMENT] app markers in the crash-surviving USB trace
 #include <math.h>
 #include "esp_task_wdt.h"
 
@@ -540,6 +541,7 @@ void USBHostUPS::handleEvent(const HidEvent& ev) {
         handleDisconnected(ev.handle);
         break;
     case HidEvent::TRANSFER_ERROR:
+        usb_trace_add(UT_APP, UTA_XFER_ERROR, nullptr, 0);
         if (ev.handle == _hid_dev_handle && (_quirks & QUIRK_NO_INTERRUPT_PIPE)) {
             // US-108: upstream never reads this pipe (usbhid-ups.c:1432), so its errors
             // are not a fault and must not climb to a restart
@@ -710,6 +712,11 @@ void USBHostUPS::claimInterface(hid_host_device_handle_t handle) {
     }
     _is_ready_to_poll = true;
 
+    {
+        hid_host_dev_params_t p;
+        uint8_t d[1] = { (uint8_t)(hid_host_device_get_params(handle, &p) == ESP_OK ? p.iface_num : 0xFF) };
+        usb_trace_add(UT_APP, UTA_CLAIMED, d, 1);
+    }
     log("INFO", "UPS interface claimed and ready (IN endpoint MPS %u).", (unsigned)_ep_in_mps);
 }
 
@@ -784,6 +791,7 @@ void USBHostUPS::handleDisconnected(hid_host_device_handle_t handle) {
     clearDeferredClaim(handle);
     if (_hid_dev_handle != handle) return;
 
+    usb_trace_add(UT_APP, UTA_DISCONNECTED, nullptr, 0);
     log("INFO", "HID Device Disconnected");
     releaseBoundState();
 }
@@ -1093,6 +1101,7 @@ void USBHostUPS::recoverInterface(const char* why, uint32_t now, bool clear_in_h
         return;
     }
     log("WARN", "[USB] Restarting HID interface: %s", why);
+    usb_trace_add(UT_APP, UTA_RECOVER, nullptr, 0);
     esp_err_t err = hid_host_device_stop(_hid_dev_handle); // halt + flush + clear of the IN endpoint
     if (err != ESP_OK) log("WARN", "[USB] hid_host_device_stop failed: %s", esp_err_to_name(err));
     _in_reasm.reset();
@@ -1125,6 +1134,7 @@ void USBHostUPS::retryInterfaceStart(uint32_t now) {
     esp_err_t err = hid_host_device_start(_hid_dev_handle);
     if (err == ESP_OK) {
         _in_restart_pending = false;
+        usb_trace_add(UT_APP, UTA_IN_RESTARTED, nullptr, 0);
         log("INFO", "[USB] HID interface restarted");
         return;
     }
@@ -1139,6 +1149,7 @@ void USBHostUPS::retryInterfaceStart(uint32_t now) {
 
 void USBHostUPS::requestRestart(const char* why) {
     if (_restart_requested) return;
+    usb_trace_add(UT_APP, UTA_RESTART_REQ, nullptr, 0);
     log("ERROR", "[USB] Recovery exhausted (%s): system restart requested", why);
     _restart_reason = why;
     _restart_requested = true;

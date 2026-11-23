@@ -14,7 +14,7 @@
 extern "C" {
 #endif
 
-#define USB_TRACE_LEN 128
+#define USB_TRACE_LEN 256
 
 typedef enum {
     UT_CTRL_SUBMIT = 1,  // d = setup packet, x = iface handle's iface_num (0xFF if n/a)
@@ -33,8 +33,19 @@ typedef enum {
     UT_CLOSE,            // x = iface_num, d[0] = state, d[1] = best_effort
     UT_OPEN,             // x = iface_num
     UT_DEV_GONE,         // x = 0
-    UT_APP,              // x = app code, d = free form
+    UT_APP,              // x = app code (usb_trace_app_t), d = free form
+    UT_DEV_NEW,          // x = USB address of the new device
 } usb_trace_ev_type_t;
+
+// Codes of UT_APP, written by USBHostUPS
+typedef enum {
+    UTA_CLAIMED = 1,     // UPS interface claimed, d[0] = iface_num
+    UTA_XFER_ERROR,      // HID_HOST_INTERFACE_EVENT_TRANSFER_ERROR received
+    UTA_RECOVER,         // recoverInterface() starts
+    UTA_RESTART_REQ,     // requestRestart()
+    UTA_DISCONNECTED,    // handleDisconnected()
+    UTA_IN_RESTARTED,    // retryInterfaceStart() succeeded
+} usb_trace_app_t;
 
 typedef struct {
     uint32_t t_ms;   // ms since boot
@@ -49,6 +60,9 @@ void usb_trace_add(uint8_t ev, uint16_t x, const uint8_t *d, uint8_t dlen);
 /** Copy the events left by the previous boot (oldest first), then clear the ring.
  *  Returns the number copied; 0 when the RTC memory holds no valid trace. */
 uint16_t usb_trace_take_previous(usb_trace_ev_t *out, uint16_t max);
+
+/** Copy the events of this boot so far (oldest first), leaving the ring untouched. */
+uint16_t usb_trace_snapshot(usb_trace_ev_t *out, uint16_t max);
 
 /** Call once at boot, before any USB activity: snapshots the previous ring and starts a new one. */
 void usb_trace_boot(void);

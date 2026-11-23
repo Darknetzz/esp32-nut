@@ -819,6 +819,7 @@ static void client_event_cb(const usb_host_client_event_msg_t *event, void *arg)
     switch (event->event) {
     case USB_HOST_CLIENT_EVENT_NEW_DEV:
         ESP_LOGD(TAG, "New device connected");
+        usb_trace_add(UT_DEV_NEW, event->new_dev.address, NULL, 0);
         hid_host_device_init_attempt(event->new_dev.address);
         break;
     case USB_HOST_CLIENT_EVENT_DEV_GONE:
