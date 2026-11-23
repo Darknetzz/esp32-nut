@@ -18,6 +18,7 @@
 #include "usb/usb_host.h"
 
 #include "usb/hid_host.h"
+#include "usb/usb_trace.h" // [esp32-nut, EXPERIMENT]
 
 // We are allowing realloc ctrl_xfer buffer, so max report desc size is limited by sane value
 // based on very large, exotic devices: can go into the low kilobytes
@@ -93,7 +94,8 @@ typedef struct hid_host_device {
     SemaphoreHandle_t ctrl_xfer_done;           /**< Control transfer semaphore */
     usb_transfer_t *ctrl_xfer;                  /**< Pointer to control transfer buffer */
     volatile bool ctrl_inflight;                /**< ctrl_xfer is owned by the USB Host stack (submitted, callback not yet delivered) */
-    usb_device_handle_t dev_hdl;                /**< USB device handle */
+    volatile bool ctrl_gave_up;                 /**< [EXPERIMENT] requester timed out on the in-flight ctrl_xfer */
+    usb_device_handle_t dev_hdl;               /**< USB device handle */
     uint8_t dev_addr;                           /**< USB device address */
 #ifdef HID_HOST_REMOTE_WAKE_SUPPORTED
     bool remote_wakeup_enabled;                 /**< To indicate whether remote wakeup is currently enabled */
@@ -133,6 +135,13 @@ typedef struct hid_interface {
     hid_iface_state_t state;                /**< Interface state */
     hid_iface_state_t last_state;           /**< Interface last state before entering suspended mode */
 } hid_iface_t;
+
+// [esp32-nut, EXPERIMENT] Endpoint operation of an interface into the USB trace
+static inline void ut_ep(uint8_t ev, hid_iface_t *iface, esp_err_t err)
+{
+    uint8_t d[2] = { iface->ep_in, (uint8_t)err };
+    usb_trace_add(ev, iface->dev_params.iface_num, d, 2);
+}
 
 /**
  * @brief HID driver default context
@@ -577,6 +586,7 @@ static bool hid_host_device_init_attempt(uint8_t dev_addr)
  */
 static esp_err_t hid_host_device_disconnected(usb_device_handle_t dev_hdl)
 {
+    usb_trace_add(UT_DEV_GONE, 0, NULL, 0);
     hid_device_t *hid_device = get_hid_device_by_handle(dev_hdl);
     HID_RETURN_ON_INVALID_ARG(hid_device);
 
@@ -839,10 +849,11 @@ static void client_event_cb(const usb_host_client_event_msg_t *event, void *arg)
  */
 static esp_err_t hid_host_interface_claim_and_prepare_transfer(hid_iface_t *iface)
 {
-    HID_RETURN_ON_ERROR( usb_host_interface_claim( s_hid_driver->client_handle,
-                                                   iface->parent->dev_hdl,
-                                                   iface->dev_params.iface_num, 0),
-                         "Unable to claim Interface");
+    esp_err_t claim_err = usb_host_interface_claim( s_hid_driver->client_handle,
+                                                    iface->parent->dev_hdl,
+                                                    iface->dev_params.iface_num, 0);
+    { uint8_t d[2] = { (uint8_t)claim_err, iface->ep_in }; usb_trace_add(UT_IFACE_CLAIM, iface->dev_params.iface_num, d, 2); }
+    HID_RETURN_ON_ERROR( claim_err, "Unable to claim Interface");
 
     // [esp32-nut, review M3] Do not leave the interface claimed when the allocation fails
     esp_err_t ret = usb_host_transfer_alloc(iface->ep_in_mps, 0, &iface->in_xfer);
@@ -875,10 +886,11 @@ static esp_err_t hid_host_interface_release_and_free_transfer(hid_iface_t *iface
                         ESP_ERR_NOT_FOUND,
                         "Interface handle not found");
 
-    HID_RETURN_ON_ERROR( usb_host_interface_release(s_hid_driver->client_handle,
-                                                    iface->parent->dev_hdl,
-                                                    iface->dev_params.iface_num),
-                         "Unable to release HID Interface");
+    esp_err_t rel_err = usb_host_interface_release(s_hid_driver->client_handle,
+                                                   iface->parent->dev_hdl,
+                                                   iface->dev_params.iface_num);
+    { uint8_t d[2] = { (uint8_t)rel_err, iface->ep_in }; usb_trace_add(UT_IFACE_RELEASE, iface->dev_params.iface_num, d, 2); }
+    HID_RETURN_ON_ERROR( rel_err, "Unable to release HID Interface");
 
     // [esp32-nut, review M3] No abort() on a free error, and no dangling pointer after it
     esp_err_t ret = usb_host_transfer_free(iface->in_xfer);
@@ -922,14 +934,16 @@ static esp_err_t hid_host_disable_interface(hid_iface_t *iface)
                         "Interface wrong state");
 
     if (HID_INTERFACE_STATE_ACTIVE == iface->state) {
-        HID_RETURN_ON_ERROR( usb_host_endpoint_halt(iface->parent->dev_hdl, iface->ep_in),
-                             "Unable to HALT EP");
-        HID_RETURN_ON_ERROR( usb_host_endpoint_flush(iface->parent->dev_hdl, iface->ep_in),
-                             "Unable to FLUSH EP");
+        esp_err_t e = usb_host_endpoint_halt(iface->parent->dev_hdl, iface->ep_in);
+        ut_ep(UT_EP_HALT, iface, e);
+        HID_RETURN_ON_ERROR( e, "Unable to HALT EP");
+        e = usb_host_endpoint_flush(iface->parent->dev_hdl, iface->ep_in);
+        ut_ep(UT_EP_FLUSH, iface, e);
+        HID_RETURN_ON_ERROR( e, "Unable to FLUSH EP");
     }
     // If interface state is suspended, the EP is already flushed and halted, only clear the EP
     // If suspended, may return ESP_ERR_INVALID_STATE
-    usb_host_endpoint_clear(iface->parent->dev_hdl, iface->ep_in);
+    ut_ep(UT_EP_CLEAR, iface, usb_host_endpoint_clear(iface->parent->dev_hdl, iface->ep_in));
 
     iface->state = HID_INTERFACE_STATE_READY;
 
@@ -966,17 +980,19 @@ static esp_err_t hid_host_disable_interface_disconnect(hid_iface_t *iface)
     if (HID_INTERFACE_STATE_ACTIVE == iface->state) {
         esp_err_t ep_err;
         ep_err = usb_host_endpoint_halt(iface->parent->dev_hdl, iface->ep_in);
+        ut_ep(UT_EP_HALT, iface, ep_err);
         if (ep_err != ESP_OK) {
             ESP_LOGD(TAG, "EP halt failed on disconnect (device likely gone): %s",
                      esp_err_to_name(ep_err));
         }
         ep_err = usb_host_endpoint_flush(iface->parent->dev_hdl, iface->ep_in);
+        ut_ep(UT_EP_FLUSH, iface, ep_err);
         if (ep_err != ESP_OK) {
             ESP_LOGD(TAG, "EP flush failed on disconnect (device likely gone): %s",
                      esp_err_to_name(ep_err));
         }
     }
-    usb_host_endpoint_clear(iface->parent->dev_hdl, iface->ep_in);
+    ut_ep(UT_EP_CLEAR, iface, usb_host_endpoint_clear(iface->parent->dev_hdl, iface->ep_in));
 
     iface->state = HID_INTERFACE_STATE_READY;
 
@@ -994,6 +1010,7 @@ static void in_xfer_done(usb_transfer_t *in_xfer)
     assert(in_xfer->context);
 
     hid_iface_t *iface = (hid_iface_t *) in_xfer->context;
+    { uint8_t d[1] = { in_xfer->bEndpointAddress }; usb_trace_add(UT_IN_DONE, (uint16_t)in_xfer->status, d, 1); }
 
     switch (in_xfer->status) {
     case USB_TRANSFER_STATUS_COMPLETED:
@@ -1003,6 +1020,7 @@ static void in_xfer_done(usb_transfer_t *in_xfer)
         // [esp32-nut, ADR 0008] A failed re-submit silently stops INPUT reports forever:
         // report it so the application can restart the interface.
         esp_err_t err = usb_host_transfer_submit(in_xfer);
+        if (err != ESP_OK) usb_trace_add(UT_IN_RESUBMIT_ERR, (uint16_t)err, NULL, 0);
         if (err != ESP_OK && iface->state == HID_INTERFACE_STATE_ACTIVE) {
             ESP_LOGE(TAG, "Unable to re-submit IN transfer: %s", esp_err_to_name(err));
             hid_host_user_interface_callback(iface, HID_HOST_INTERFACE_EVENT_TRANSFER_ERROR);
@@ -1056,6 +1074,17 @@ static void ctrl_xfer_done(usb_transfer_t *ctrl_xfer)
 {
     assert(ctrl_xfer);
     hid_device_t *hid_device = (hid_device_t *)ctrl_xfer->context;
+    {
+        uint8_t d[8];
+        memcpy(d, ctrl_xfer->data_buffer, 4);          // bmRequestType, bRequest, wValue
+        d[4] = (uint8_t)ctrl_xfer->actual_num_bytes;
+        d[5] = (uint8_t)(ctrl_xfer->actual_num_bytes >> 8);
+        d[6] = hid_device->ctrl_gave_up;
+        d[7] = 0;
+        usb_trace_add(hid_device->ctrl_gave_up ? UT_CTRL_LATE_DONE : UT_CTRL_DONE,
+                      (uint16_t)ctrl_xfer->status, d, 8);
+        hid_device->ctrl_gave_up = false;
+    }
     // [esp32-nut, ADR 0008] Hand the buffer back before waking the requester.
     // If the requester already gave up (timeout), the token left in the binary
     // semaphore is drained by the next hid_control_transfer().
@@ -1127,14 +1156,21 @@ static esp_err_t hid_control_transfer(hid_device_t *hid_device,
     ctrl_xfer->num_bytes = len;
 
     hid_device->ctrl_inflight = true;
+    hid_device->ctrl_gave_up = false;
+    usb_trace_add(UT_CTRL_SUBMIT, 0xFF, ctrl_xfer->data_buffer, 8);
     esp_err_t ret = usb_host_transfer_submit_control(s_hid_driver->client_handle, ctrl_xfer);
     if (ret != ESP_OK) {
+        usb_trace_add(UT_CTRL_SUBMIT_ERR, (uint16_t)ret, ctrl_xfer->data_buffer, 8);
         hid_device->ctrl_inflight = false;
         ESP_LOGE(TAG, "Unable to submit control transfer: %s", esp_err_to_name(ret));
         return ret;
     }
 
     BaseType_t received = xSemaphoreTake(hid_device->ctrl_xfer_done, pdMS_TO_TICKS(timeout_ms));
+    if (received != pdTRUE) {
+        hid_device->ctrl_gave_up = true;
+        usb_trace_add(UT_CTRL_TIMEOUT, (uint16_t)timeout_ms, ctrl_xfer->data_buffer, 8);
+    }
 
     // [esp32-nut, ADR 0008] The HCD does not implement transfer timeouts and a client cannot
     // halt/flush EP0, so the URB stays owned by the stack. ctrl_inflight remains set and
@@ -1752,6 +1788,8 @@ static esp_err_t hid_host_device_close_impl(hid_host_device_handle_t hid_dev_han
     hid_iface_t *hid_iface = get_iface_by_handle(hid_dev_handle);
     HID_GOTO_ON_FALSE(hid_iface, ESP_ERR_INVALID_ARG, "Invalid HID device handle");
 
+    { uint8_t d[2] = { (uint8_t)hid_iface->state, (uint8_t)best_effort };
+      usb_trace_add(UT_CLOSE, hid_iface->dev_params.iface_num, d, 2); }
     ESP_LOGD(TAG, "Close addr %d, iface %d, state %d (best_effort=%d)",
              hid_iface->dev_params.addr,
              hid_iface->dev_params.iface_num,
@@ -2004,6 +2042,7 @@ esp_err_t hid_host_device_start(hid_host_device_handle_t hid_dev_handle)
 
     // start data transfer
     esp_err_t ret = usb_host_transfer_submit(iface->in_xfer);
+    { uint8_t d[2] = { iface->ep_in, (uint8_t)ret }; usb_trace_add(UT_IN_START, iface->dev_params.iface_num, d, 2); }
     if (ret != ESP_OK) {
         // [esp32-nut, ADR 0008] Keep the interface restartable: after a stop, the flushed
         // IN transfer stays in flight until the client task processes its callback, so the

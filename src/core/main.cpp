@@ -22,6 +22,30 @@
 #include "network/syslog_output.h"
 #include "network/ntp_clock.h"
 #include "core/time_settings_store.h"
+#include "usb/usb_trace.h" // [EXPERIMENT] crash-surviving USB trace
+#include <WiFi.h>
+
+// [EXPERIMENT] Logs the USB events of the previous boot after a crash reset, oldest first,
+// with the time relative to the last event (the panic follows it closely)
+static void logPreviousUsbTrace() {
+    esp_reset_reason_t r = esp_reset_reason();
+    static usb_trace_ev_t evs[USB_TRACE_LEN];
+    uint16_t n = usb_trace_take_previous(evs, USB_TRACE_LEN);
+    if (n == 0) return;
+    if (r != ESP_RST_PANIC && r != ESP_RST_INT_WDT && r != ESP_RST_TASK_WDT && r != ESP_RST_WDT) return;
+    // Only the tail matters: the last 40 events before the crash
+    uint16_t first = n > 40 ? n - 40 : 0;
+    uint32_t t_last = evs[n - 1].t_ms;
+    AppLogger::log("ERROR", "[TRACE] USB events before the crash: %u recorded, last %u shown (t = ms before last event, uptime of last %lu ms)",
+                   (unsigned)n, (unsigned)(n - first), (unsigned long)t_last);
+    for (uint16_t i = first; i < n; i++) {
+        delay(15); // the log queue holds 40 lines: let the syslog task drain it
+        const usb_trace_ev_t& e = evs[i];
+        AppLogger::log("ERROR", "[TRACE] %3u -%5lu c%u %-15s x=0x%04x d=%02x %02x %02x %02x %02x %02x %02x %02x",
+                       (unsigned)i, (unsigned long)(t_last - e.t_ms), (unsigned)e.core, usb_trace_ev_name(e.ev),
+                       (unsigned)e.x, e.d[0], e.d[1], e.d[2], e.d[3], e.d[4], e.d[5], e.d[6], e.d[7]);
+    }
+}
 
 USBHostUPS usb_ups;
 ConfigManager config_mgr;
@@ -146,6 +170,7 @@ LedState computeSystemState(bool wifiConnected, bool upsConnected) {
 void setup() {
     // Prima di tutto: protegge il panic handler se manca la partizione coredump
     CrashDiag::begin();
+    usb_trace_boot(); // [EXPERIMENT] before any USB activity
 
     // Log queue before the first line: the boot log reaches the remote outputs once the
     // network is up (US-116). The task starts later, when the outputs are configured
@@ -348,6 +373,15 @@ void loop() {
     uint32_t now = millis();
 
     esp_task_wdt_reset();
+
+    // [EXPERIMENT] Dump the previous boot's USB trace once the network can carry it
+    static bool usb_trace_dumped = false;
+    if (!usb_trace_dumped && (WiFi.isConnected() || now > 4000)) {
+        usb_trace_dumped = true;
+        logPreviousUsbTrace();
+        esp_task_wdt_reset();
+        now = millis();
+    }
 
     // Check timer per azzeramento flag manual_ap
     closeManualApWindow(now);
