@@ -1339,19 +1339,8 @@ bool USBHostUPS::requestReport(uint8_t report_id, uint8_t report_type, uint16_t 
     if (length > sizeof(_request_buffer)) length = sizeof(_request_buffer);
 
     // Blocking control transfer: no application lock may be held here (ADR 0008)
-    size_t requested = length;
     esp_err_t err = hid_class_request_get_report(_hid_dev_handle, report_type, report_id, _request_buffer, &length);
     noteControlResult(err, millis());
-
-    // [EXPERIMENT] What the Vertiv Edge answers to Feature report 30, a few times only
-    static uint8_t exp_r30_logged = 0;
-    if (report_type == 3 && report_id == 30 && exp_r30_logged < 5) {
-        exp_r30_logged++;
-        log("WARN", "[EXPERIMENT] GET_REPORT Feature 30: wLength %u, err %s, got %u bytes: %02x %02x %02x %02x %02x %02x %02x %02x",
-            (unsigned)requested, esp_err_to_name(err), (unsigned)length,
-            _request_buffer[0], _request_buffer[1], _request_buffer[2], _request_buffer[3],
-            _request_buffer[4], _request_buffer[5], _request_buffer[6], _request_buffer[7]);
-    }
 
     if (err == ESP_OK && length > 0) {
         _stat_get_ok++;

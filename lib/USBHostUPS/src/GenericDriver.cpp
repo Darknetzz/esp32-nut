@@ -633,11 +633,7 @@ void GenericDriver::loop(IHidTransport* host, UPSData& data, uint32_t now) {
         host->requestStringDescriptor(item.id);
     } else {
         uint16_t len = item.length ? item.length : host->getHIDParser()->getExpectedLength(item.id, item.report_type);
-        uint16_t req = requestLength(item.report_type, item.id, len);
-        // [EXPERIMENT] Feature report 30 (Outlet.PercentLoad) of the Vertiv Edge panics the
-        // HCD with wLength 2: ask for a full EP0 packet instead
-        if (item.report_type == 3 && item.id == 30 && req < 8) req = 8;
-        host->requestReport(item.id, item.report_type, req);
+        host->requestReport(item.id, item.report_type, requestLength(item.report_type, item.id, len));
     }
 }
 
